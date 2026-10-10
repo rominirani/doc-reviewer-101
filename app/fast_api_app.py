@@ -305,10 +305,10 @@ REVIEWER_HTML = """<!DOCTYPE html>
 <body>
   <div class="card">
     <div class="header-row">
-      <h1>Google Docs AI Reviewer</h1>
+      <h1>Google Docs AI Reviewer &amp; Fact-Checker</h1>
       <a id="logout-btn" href="/auth/logout" class="btn btn-secondary hidden">Sign Out</a>
     </div>
-    <p>Automatically review Google Docs using customizable criteria for Suggested Edits and Comments.</p>
+    <p>Automatically fact-check and review Google Docs using <strong>Google Developer Knowledge MCP</strong>, <strong>Google Search Grounding</strong>, and customizable criteria for Suggested Edits and Comments.</p>
 
     <div id="login-section">
       <a href="/auth/login" class="btn">Sign in with Google</a>

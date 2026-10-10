@@ -51,6 +51,7 @@ echo "=================================================================="
 echo "1. Enabling required Google Cloud APIs..."
 gcloud services enable \
   aiplatform.googleapis.com \
+  developerknowledge.googleapis.com \
   docs.googleapis.com \
   drive.googleapis.com \
   picker.googleapis.com \
@@ -65,8 +66,8 @@ if ! gcloud iam service-accounts describe "${SA_EMAIL}" --project="${GOOGLE_CLOU
     --project="${GOOGLE_CLOUD_PROJECT}"
 fi
 
-echo "3. Granting Vertex AI & Observability IAM roles to ${SA_EMAIL}..."
-for role in "roles/aiplatform.user" "roles/logging.logWriter" "roles/cloudtrace.agent"; do
+echo "3. Granting Vertex AI, Developer Knowledge & Observability IAM roles to ${SA_EMAIL}..."
+for role in "roles/aiplatform.user" "roles/serviceusage.serviceUsageConsumer" "roles/logging.logWriter" "roles/cloudtrace.agent"; do
   gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
     --member="serviceAccount:${SA_EMAIL}" \
     --role="${role}" \
@@ -83,7 +84,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --project "${GOOGLE_CLOUD_PROJECT}" \
   --allow-unauthenticated \
   --service-account="${SA_EMAIL}" \
-  --min-instances=1 \
+  --min-instances=0 \
   --max-instances=1 \
   --set-env-vars="GOOGLE_GENAI_USE_VERTEXAI=TRUE,GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION:-global},GOOGLE_CLOUD_PROJECT_NUMBER=${GOOGLE_CLOUD_PROJECT_NUMBER},OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID},OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET},GOOGLE_PICKER_API_KEY=${GOOGLE_PICKER_API_KEY}"
 

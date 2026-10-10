@@ -1,12 +1,17 @@
-# Google Docs AI Reviewer (`doc-reviewer-101`)
+# Google Docs AI Reviewer & Fact-Checker (`doc-reviewer-101`)
 
-An AI-powered Google Docs Review Web Application built with the **Google Agent Development Kit (ADK)**, **Gemini 3.8 Flash on Vertex AI**, **FastAPI**, **Google Drive Picker**, and the new **Google Docs API programmatic Comments & Suggested Edits** capabilities.
+An AI-powered Google Docs Review and Hybrid Fact-Checking Web Application built with the **Google Agent Development Kit (ADK)**, **Gemini 3.8 Flash on Vertex AI**, **Google Developer Knowledge MCP Server**, **Google Search Grounding**, **Google Drive Picker**, and the new **Google Docs API programmatic Comments & Suggested Edits** capabilities.
 
-Instead of destructively overwriting your document text or dumping feedback into a separate chat window, this agent acts like a real human editor inside Google Docs:
-1. **Attaches Editorial Comments (`insertComment`)** anchored to exact sentences or claims in your document margin.
-2. **Proposes Inline Suggested Edits (`writeControl: {"writeMode": "SUGGEST"}`)** for typos, grammar, and style improvements that you can **Accept (✓)** or **Reject (✗)** with a single click.
-3. **Customizable Review Templates**: Define your own criteria for what the agent should flag as a *Comment* versus fix as a *Suggested Edit* directly in the Web UI.
-4. **Personal Google Account + Google Drive Picker**: Sign in with your own Google account, browse **My Drive** or **Shared Drives** via the native Google Drive Picker modal, and review any Google Doc you have access to—so every comment and suggested edit appears under your name.
+> **Repository & Cloud Run Deployment Note**: This repository contains the complete, production-ready code for both the core **Google Docs AI Reviewer** ( inline Suggested Edits + Margin Comments + Google Drive Picker) and the **Hybrid Fact-Checker** upgrade (Google Developer Knowledge Remote MCP Server + Google Search Grounding via ADK `AgentTool`). All configuration files (`pyproject.toml`, `Dockerfile`, and `deploy.sh`) are fully updated so anyone can run the app locally or deploy their own instance to **Google Cloud Run** with a single command (`./deploy.sh`).
+
+Instead of destructively overwriting your document text or dumping feedback into a separate chat window, this agent collaborates inside Google Docs like a real human editor and technical fact-checker:
+1. **Hybrid Fact-Checking & Citation Grounding**:
+   - Verifies **Google Cloud, Gemini, ADK, Firebase, Android, Chrome, Flutter, and Go** claims against official documentation via the **Google Developer Knowledge Remote MCP Server** (`https://developerknowledge.googleapis.com/mcp`).
+   - Verifies **general public facts, release dates, and industry statistics** via **Google Search Grounding (`google_search`)** wrapped in an ADK `AgentTool`.
+2. **Attaches Editorial & Citation Comments (`insertComment`)** anchored to exact sentences or claims in your document margin—including the verified source URLs.
+3. **Proposes Inline Suggested Edits (`writeControl: {"writeMode": "SUGGEST"}`)** for outdated numbers, wrong CLI flags, typos, grammar, and style improvements that you can **Accept (✓)** or **Reject (✗)** with a single click.
+4. **Customizable Review Templates**: Define your own criteria for what the agent should flag as a *Comment* versus fix as a *Suggested Edit* directly in the Web UI.
+5. **Personal Google Account + Google Drive Picker**: Sign in with your own Google account, browse **My Drive** or **Shared Drives** via the native Google Drive Picker modal, and review any Google Doc you have access to—so every comment and suggested edit appears under your name.
 
 ---
 
@@ -22,12 +27,14 @@ flowchart LR
     subgraph CloudRun["FastAPI + Google ADK (Local or Cloud Run)"]
         Auth["OAuth 2.0 Web Flow\n(/auth/login & /auth/callback)"]
         State["ADK Session State\n(user_access_token + criteria)"]
-        Agent["ADK Agent\n(doc_reviewer_101)"]
+        Agent["ADK Root Agent\n(doc_reviewer_101)"]
+        SearchAgent["Web Search Sub-Agent\n(AgentTool + google_search)"]
         Tools["Docs API Tools\n1. read_google_doc\n2. insert_comments\n3. propose_suggested_edits"]
     end
 
-    subgraph GCP["Google Cloud & Workspace APIs"]
+    subgraph GCP["Google Cloud, MCP & Workspace APIs"]
         Vertex["Vertex AI\n(Gemini 3.8 Flash)"]
+        DevKnow["Developer Knowledge MCP\n(developerknowledge.googleapis.com/mcp)"]
         DocsAPI["Google Docs API v1\n(insertComment + SUGGEST mode)"]
     end
 
@@ -36,6 +43,9 @@ flowchart LR
     UI -->|"3. POST /api/review\n(doc_id + custom criteria)"| State
     State --> Agent
     Agent <-->|"Service Account ADC"| Vertex
+    Agent <-->|"McpToolset (ADC)"| DevKnow
+    Agent <-->|"AgentTool"| SearchAgent
+    SearchAgent <-->|"Google Search Grounding"| Vertex
     Agent --> Tools
     Tools -->|"User OAuth Token"| DocsAPI
 ```
@@ -43,7 +53,7 @@ flowchart LR
 ### Dual-Identity Security Model
 This project uses two distinct identities so you never have to share personal Google Docs with a backend service account:
 - **Your Personal Google Account (OAuth 2.0 Token)**: Used *exclusively* by the Google Drive Picker and Google Docs API tools (`read_google_doc`, `insert_comments`, `propose_suggested_edits`) so the agent only accesses documents you select, and all comments/suggestions are authored by you.
-- **Google Cloud Project / Service Account (ADC)**: Used *exclusively* by the ADK `Runner` on the backend to call **Gemini 3.8 Flash** on Vertex AI (`aiplatform.googleapis.com`).
+- **Google Cloud Project / Service Account (ADC)**: Used *exclusively* by the ADK `Runner` on the backend to call **Gemini 3.8 Flash** on Vertex AI (`aiplatform.googleapis.com`) and the **Google Developer Knowledge MCP Server** (`developerknowledge.googleapis.com`).
 
 ---
 
@@ -52,7 +62,7 @@ This project uses two distinct identities so you never have to share personal Go
 ```text
 doc-reviewer-101/
 ├── app/
-│   ├── agent.py               # ADK Agent definition, dynamic prompt template, and default criteria
+│   ├── agent.py               # ADK Root Agent, Developer Knowledge MCP Toolset, Search AgentTool & prompts
 │   ├── tools.py               # Google Docs API v1 tools (1-based index mapping, comments, suggested edits)
 │   ├── fast_api_app.py        # FastAPI server, Google OAuth 2.0 flow, Google Drive Picker UI (/reviewer)
 │   └── app_utils/             # ADK Runner, A2A routes, and telemetry helpers
@@ -60,7 +70,7 @@ doc-reviewer-101/
 ├── .env.example               # Template for local and Cloud Run environment variables
 ├── deploy.sh                  # Automated one-command Cloud Run deployment script
 ├── Dockerfile                 # Production container image using Python 3.12 and uv
-└── pyproject.toml             # Python dependencies managed by uv
+└── pyproject.toml             # Python dependencies managed by uv (including google-adk & mcp)
 ```
 
 ---
@@ -86,7 +96,7 @@ uv sync
 
 ### Step 2: Enable Required Google Cloud APIs
 
-Set your Google Cloud Project ID and enable the required APIs:
+Set your Google Cloud Project ID and enable the required APIs (including `developerknowledge.googleapis.com` for the Developer Knowledge MCP Server):
 
 ```bash
 export PROJECT_ID="your-gcp-project-id"
@@ -94,6 +104,7 @@ gcloud config set project "${PROJECT_ID}"
 
 gcloud services enable \
   aiplatform.googleapis.com \
+  developerknowledge.googleapis.com \
   docs.googleapis.com \
   drive.googleapis.com \
   picker.googleapis.com \
@@ -181,7 +192,7 @@ GOOGLE_PICKER_API_KEY="AIzaSy-your-browser-api-key"
 
 ## Running Locally
 
-1. Authenticate your local machine with Google Cloud for Vertex AI model calls:
+1. Authenticate your local machine with Google Cloud for Vertex AI and Developer Knowledge MCP calls:
    ```bash
    gcloud auth application-default login
    ```
@@ -194,6 +205,17 @@ GOOGLE_PICKER_API_KEY="AIzaSy-your-browser-api-key"
    - Click **Browse Google Drive** to select a Google Doc from **My Drive** or **Shared Drives** (or paste a Document ID directly).
    - Customize the **Suggested Edits Criteria** and **Editorial Comments Criteria** (or keep the defaults).
    - Click **Run AI Review** and then click **Open Reviewed Google Doc** to inspect the inline suggested edits and comments!
+
+### Sample Test Document to Try Out
+Create a new Google Doc and paste these two paragraphs containing deliberate Cloud Run quota myths, a wrong `gcloud` CLI flag, an incorrect Python 3.12 release date, and typos:
+
+```text
+Project Proposal: Migrating Our Analytics API to Google Cloud Run
+
+Our engineering team plans to migrate our Python backend to Google Cloud Run next month. Currently, our batch jobs take 25 minutes to complete, which is a problem because Cloud Run services only support a maximum request timeout of 15 minutes and a maximum memory limit of 8 GiB per instance. To deploy the container publicly from source, engineers will run gcloud run deploy my-api --source . --public-access.
+
+For runtime language support, we are standardizing on Python 3.12, which was officially released in October 2021. We beleive this migration will immediatly reduce our monthly infrastructure bill by 95% within the first week without requiring any load testing.
+```
 
 ---
 
@@ -211,9 +233,9 @@ chmod +x deploy.sh
 ```
 
 What `deploy.sh` does automatically:
-- Enables all required Google Cloud APIs (`aiplatform`, `docs`, `drive`, `picker`, `run`, `cloudbuild`).
-- Creates a dedicated least-privilege runtime service account (`doc-reviewer-sa@<PROJECT_ID>.iam.gserviceaccount.com`) with `roles/aiplatform.user`, `roles/logging.logWriter`, and `roles/cloudtrace.agent`.
-- Deploys the container to Cloud Run with `--max-instances=1` (for in-memory session consistency) and omits `OAUTH_REDIRECT_URI` so the FastAPI app automatically detects its `https://<service>.run.app/auth/callback` URL.
+- Enables all required Google Cloud APIs (`aiplatform`, `developerknowledge`, `docs`, `drive`, `picker`, `run`, `cloudbuild`).
+- Creates a dedicated least-privilege runtime service account (`doc-reviewer-sa@<PROJECT_ID>.iam.gserviceaccount.com`) with `roles/aiplatform.user`, `roles/serviceusage.serviceUsageConsumer`, `roles/logging.logWriter`, and `roles/cloudtrace.agent`.
+- Deploys the container to Cloud Run with `--min-instances=0` (scales to zero when idle so you pay nothing when unused) and `--max-instances=1` (for in-memory session consistency), while omitting `OAUTH_REDIRECT_URI` so the FastAPI app automatically detects its `https://<service>.run.app/auth/callback` URL.
 
 ### 2. Authorize Your Cloud Run URL in Google Cloud Console
 
@@ -230,15 +252,19 @@ Once `deploy.sh` prints your `https://<service>.run.app` URL:
 
 ## How It Works Under the Hood
 
-### 1. Accurate 1-Based Index Mapping (`_extract_text_and_index_map`)
+### 1. Hybrid Fact-Checking (`McpToolset` + `AgentTool`)
+- **Developer Knowledge Remote MCP Server**: Connected via ADK's `McpToolset` (`https://developerknowledge.googleapis.com/mcp`), exposing `answer_query`, `search_documents`, and `get_documents` to verify Google Cloud, Gemini, ADK, Firebase, Android, Chrome, Flutter, and Go claims against official documentation.
+- **Google Search Grounding via `AgentTool`**: Because Gemini's `google_search` is a model-internal grounding tool that cannot be mixed directly on the same `Agent` alongside custom `FunctionTool`s or `McpToolset`s, we wrap a specialist `web_search_verifier` sub-agent inside `AgentTool(web_search_verifier)`.
+
+### 2. Accurate 1-Based Index Mapping (`_extract_text_and_index_map`)
 When `includeTabsContent=True` is passed to `documents().get()`, Google Docs places the document body inside `doc["tabs"][0]["documentTab"]["body"]["content"]`. Every `textRun` element carries a 1-based UTF-16 `startIndex`. Our tool builds a parallel character-to-index lookup array (`doc_indices`) across paragraphs and table cells so any substring match maps back to its exact `[startIndex, endIndex)` coordinates in the document.
 
-### 2. Why Comments Must Run *Before* Suggested Edits
+### 3. Why Comments Must Run *Before* Suggested Edits
 When you submit a `deleteContentRange` + `insertText` with `writeControl: {"writeMode": "SUGGEST"}`, Google Docs does **not** immediately remove the deleted characters. Instead, both the original text (marked for deletion) and the new replacement text coexist inline in the document (`SUGGESTIONS_INLINE`).
 - If Suggested Edits ran first, any word modified inside a sentence would alter the inline text of that sentence, causing subsequent `insertComment` phrase searches to miss!
-- By enforcing **Step 1: `read_google_doc` → Step 2: `insert_comments` → Step 3: `propose_suggested_edits`**, comments anchor cleanly to the original text first.
+- By enforcing **`read_google_doc` → Fact-Check → `insert_comments` → `propose_suggested_edits`**, comments anchor cleanly to the original text first.
 
-### 3. Reverse-Index Sorting for Batch Suggested Edits
+### 4. Reverse-Index Sorting for Batch Suggested Edits
 Within `propose_suggested_edits`, all matched text ranges are sorted in **descending order by `startIndex`** (`reverse=True`) and filtered to prevent overlapping ranges before sending a single `documents().batchUpdate()` request. Editing from the end of the document toward the beginning ensures earlier character indices never shift during the batch operation.
 
 ---
