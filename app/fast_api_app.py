@@ -47,17 +47,29 @@ DOC_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{10,100}$")
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    from app.addons.ai_comments import ai_comment_app
     from app.agent import app as adk_app
     from app.agent import root_agent
 
+    session_service = services.get_session_service()
+    artifact_service = services.get_artifact_service()
+
     runner = Runner(
         app=adk_app,
-        session_service=services.get_session_service(),
-        artifact_service=services.get_artifact_service(),
+        session_service=session_service,
+        artifact_service=artifact_service,
+        auto_create_session=True,
+    )
+    ai_comment_runner = Runner(
+        app=ai_comment_app,
+        session_service=session_service,
+        artifact_service=artifact_service,
         auto_create_session=True,
     )
     app.state.runner = runner
     app.state.agent_app_name = adk_app.name
+    app.state.ai_comment_runner = ai_comment_runner
+    app.state.ai_comment_app_name = ai_comment_app.name
     await attach_a2a_routes(
         app,
         agent=root_agent,
@@ -278,6 +290,56 @@ async def review_document(body: ReviewRequest, request: Request):
     }
 
 
+class AiCommentsRequest(BaseModel):
+    document_id: str
+
+
+@app.post("/api/ai-comments")
+async def process_ai_comments(body: AiCommentsRequest, request: Request):
+    """Part 3 Add-On Endpoint: Processes open @ai comments into Suggested Edits + Comment Replies."""
+    token = _get_user_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Please sign in with Google first.")
+
+    doc_id = body.document_id.strip()
+    if not DOC_ID_PATTERN.match(doc_id):
+        raise HTTPException(status_code=400, detail="Invalid Google Document ID.")
+
+    runner: Runner = request.app.state.ai_comment_runner
+    app_name: str = request.app.state.ai_comment_app_name
+    user_id = "web-user"
+    adk_session_id = str(uuid.uuid4())
+
+    await runner.session_service.create_session(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=adk_session_id,
+        state={
+            "user_access_token": token,
+        },
+    )
+
+    prompt = f"Process all open @ai comments in Google Doc ID {doc_id}"
+    final_text = ""
+
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=adk_session_id,
+        new_message=genai_types.Content(
+            role="user", parts=[genai_types.Part.from_text(text=prompt)]
+        ),
+    ):
+        if event.is_final_response() and event.content and event.content.parts:
+            final_text = "".join(p.text or "" for p in event.content.parts)
+
+    return {
+        "status": "success",
+        "document_id": doc_id,
+        "document_url": f"https://docs.google.com/document/d/{doc_id}/edit",
+        "summary": final_text,
+    }
+
+
 REVIEWER_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -287,12 +349,15 @@ REVIEWER_HTML = """<!DOCTYPE html>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 40px auto; padding: 0 20px; color: #1f2937; background: #f9fafb; }
     .card { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 20px; }
+    .addon-card { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 10px; padding: 18px; margin-top: 22px; }
     h1 { margin-top: 0; font-size: 1.5rem; }
     h2 { font-size: 1.15rem; margin-top: 0; }
     button, .btn { background: #2563eb; color: #fff; border: none; padding: 10px 18px; border-radius: 8px; font-size: 0.95rem; cursor: pointer; text-decoration: none; display: inline-block; }
     button:disabled { background: #93c5fd; cursor: not-allowed; }
     .btn-secondary { background: #e5e7eb; color: #374151; font-size: 0.85rem; padding: 8px 14px; }
     .btn-picker { background: #0f9d58; color: #fff; font-weight: 500; margin-top: 8px; margin-bottom: 12px; }
+    .btn-purple { background: #7c3aed; color: #fff; font-weight: 500; }
+    .btn-purple:disabled { background: #c4b5fd; }
     input, textarea { width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 0.95rem; margin-top: 6px; margin-bottom: 16px; box-sizing: border-box; font-family: inherit; }
     textarea { resize: vertical; min-height: 90px; line-height: 1.4; }
     pre { white-space: pre-wrap; background: #f3f4f6; padding: 16px; border-radius: 8px; line-height: 1.5; }
@@ -300,6 +365,8 @@ REVIEWER_HTML = """<!DOCTYPE html>
     .header-row { display: flex; justify-content: space-between; align-items: center; }
     .hint { color: #6b7280; font-size: 0.85rem; margin-top: -4px; margin-bottom: 8px; }
     .selected-doc-badge { background: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 0.95rem; }
+    .error-badge { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 0.92rem; }
+    code { background: #e2e8f0; padding: 2px 6px; border-radius: 4px; font-size: 0.88rem; }
   </style>
 </head>
 <body>
@@ -309,6 +376,8 @@ REVIEWER_HTML = """<!DOCTYPE html>
       <a id="logout-btn" href="/auth/logout" class="btn btn-secondary hidden">Sign Out</a>
     </div>
     <p>Automatically fact-check and review Google Docs using <strong>Google Developer Knowledge MCP</strong>, <strong>Google Search Grounding</strong>, and customizable criteria for Suggested Edits and Comments.</p>
+
+    <div id="status-banner" class="error-badge hidden"></div>
 
     <div id="login-section">
       <a href="/auth/login" class="btn">Sign in with Google</a>
@@ -326,7 +395,7 @@ REVIEWER_HTML = """<!DOCTYPE html>
       <input id="doc-input" type="text" placeholder="e.g. 1WvV8RJGqJ-h2VbmB41xvJuRM1ibU-MBkMsBulkSaAN" />
 
       <div class="header-row" style="margin-top: 8px;">
-        <strong>2. Customize Review Templates</strong>
+        <strong>2. Customize Review Templates (Parts 1 &amp; 2 — Full Document Review)</strong>
         <button id="reset-template-btn" type="button" class="btn-secondary">Reset to Default Templates</button>
       </div>
 
@@ -343,11 +412,22 @@ REVIEWER_HTML = """<!DOCTYPE html>
       <textarea id="comments-criteria"></textarea>
 
       <button id="review-btn" type="button">Run AI Review</button>
+
+      <div class="addon-card">
+        <strong>3. 💬 Interactive <code>@ai</code> Comment Assistant (Part 3 Add-On)</strong>
+        <p class="hint" style="margin-top: 6px; margin-bottom: 12px;">
+          Highlight any sentence, paragraph, or code block in your Google Doc and add a comment starting with
+          <code>@ai</code> (e.g., <code>@ai make this 50% shorter for executives</code> or
+          <code>@ai verify this Cloud Run quota and rewrite</code>). Then click below to turn your comments into
+          inline <strong>Suggested Edits</strong> + thread replies!
+        </p>
+        <button id="ai-comments-btn" type="button" class="btn-purple">Process @ai Comments in Doc</button>
+      </div>
     </div>
   </div>
 
   <div id="result-card" class="card hidden">
-    <h2>Review Complete</h2>
+    <h2 id="result-title">Review Complete</h2>
     <p><a id="doc-link" href="#" target="_blank" rel="noopener noreferrer" class="btn">Open Reviewed Google Doc</a></p>
     <pre id="result-summary"></pre>
   </div>
@@ -356,6 +436,7 @@ REVIEWER_HTML = """<!DOCTYPE html>
     const loginSection = document.getElementById('login-section');
     const appSection = document.getElementById('app-section');
     const logoutBtn = document.getElementById('logout-btn');
+    const statusBanner = document.getElementById('status-banner');
     const pickerBtn = document.getElementById('picker-btn');
     const selectedDocBanner = document.getElementById('selected-doc-banner');
     const docInput = document.getElementById('doc-input');
@@ -363,13 +444,25 @@ REVIEWER_HTML = """<!DOCTYPE html>
     const commentsCriteria = document.getElementById('comments-criteria');
     const resetTemplateBtn = document.getElementById('reset-template-btn');
     const reviewBtn = document.getElementById('review-btn');
+    const aiCommentsBtn = document.getElementById('ai-comments-btn');
     const resultCard = document.getElementById('result-card');
+    const resultTitle = document.getElementById('result-title');
     const resultSummary = document.getElementById('result-summary');
     const docLink = document.getElementById('doc-link');
 
     let defaultTemplates = { suggested_edits_criteria: '', comments_criteria: '' };
     let pickerConfig = null;
     let pickerApiLoaded = false;
+
+    function showError(msg) {
+      statusBanner.textContent = msg;
+      statusBanner.classList.remove('hidden');
+    }
+
+    function clearError() {
+      statusBanner.textContent = '';
+      statusBanner.classList.add('hidden');
+    }
 
     if (window.gapi) {
       gapi.load('picker', () => {
@@ -406,21 +499,20 @@ REVIEWER_HTML = """<!DOCTYPE html>
     }
 
     pickerBtn.addEventListener('click', () => {
+      clearError();
       if (!pickerApiLoaded || !window.google || !google.picker) {
-        alert('Google Picker API is still loading. Please try again in a moment.');
+        showError('Google Picker API is still loading. Please try again in a moment.');
         return;
       }
       if (!pickerConfig || !pickerConfig.developer_key) {
-        alert('Please set GOOGLE_PICKER_API_KEY in your .env file and restart the server.');
+        showError('Please set GOOGLE_PICKER_API_KEY in your .env file and restart the server.');
         return;
       }
 
-      // View 1: My Drive & Recent Google Docs (with folders)
       const myDriveView = new google.picker.DocsView(google.picker.ViewId.DOCUMENTS)
         .setIncludeFolders(true)
         .setMimeTypes('application/vnd.google-apps.document');
 
-      // View 2: Shared Drives Google Docs
       const sharedDrivesView = new google.picker.DocsView(google.picker.ViewId.DOCUMENTS)
         .setEnableDrives(true)
         .setIncludeFolders(true)
@@ -452,12 +544,14 @@ REVIEWER_HTML = """<!DOCTYPE html>
     });
 
     reviewBtn.addEventListener('click', async () => {
+      clearError();
       const docId = docInput.value.trim();
       if (!docId) {
-        alert('Please choose a document with Browse Google Drive or enter a Document ID.');
+        showError('Please choose a document with Browse Google Drive or enter a Document ID.');
         return;
       }
       reviewBtn.disabled = true;
+      aiCommentsBtn.disabled = true;
       reviewBtn.textContent = 'Reviewing Document (takes ~15-30s)...';
       resultCard.classList.add('hidden');
 
@@ -473,17 +567,55 @@ REVIEWER_HTML = """<!DOCTYPE html>
         });
         const data = await resp.json();
         if (!resp.ok) {
-          alert(data.detail || 'Error reviewing document.');
+          showError(data.detail || 'Error reviewing document.');
           return;
         }
+        resultTitle.textContent = 'Full Document Review Complete';
         docLink.href = data.document_url;
         resultSummary.textContent = data.summary;
         resultCard.classList.remove('hidden');
       } catch (err) {
-        alert('Request failed: ' + err.message);
+        showError('Request failed: ' + err.message);
       } finally {
         reviewBtn.disabled = false;
+        aiCommentsBtn.disabled = false;
         reviewBtn.textContent = 'Run AI Review';
+      }
+    });
+
+    aiCommentsBtn.addEventListener('click', async () => {
+      clearError();
+      const docId = docInput.value.trim();
+      if (!docId) {
+        showError('Please choose a document with Browse Google Drive or enter a Document ID.');
+        return;
+      }
+      aiCommentsBtn.disabled = true;
+      reviewBtn.disabled = true;
+      aiCommentsBtn.textContent = 'Processing @ai Comments (takes ~10-25s)...';
+      resultCard.classList.add('hidden');
+
+      try {
+        const resp = await fetch('/api/ai-comments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ document_id: docId })
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          showError(data.detail || 'Error processing @ai comments.');
+          return;
+        }
+        resultTitle.textContent = '@ai Comments Processed';
+        docLink.href = data.document_url;
+        resultSummary.textContent = data.summary;
+        resultCard.classList.remove('hidden');
+      } catch (err) {
+        showError('Request failed: ' + err.message);
+      } finally {
+        aiCommentsBtn.disabled = false;
+        reviewBtn.disabled = false;
+        aiCommentsBtn.textContent = 'Process @ai Comments in Doc';
       }
     });
 

@@ -11,7 +11,8 @@ Instead of destructively overwriting your document text or dumping feedback into
 2. **Attaches Editorial & Citation Comments (`insertComment`)** anchored to exact sentences or claims in your document margin—including the verified source URLs.
 3. **Proposes Inline Suggested Edits (`writeControl: {"writeMode": "SUGGEST"}`)** for outdated numbers, wrong CLI flags, typos, grammar, and style improvements that you can **Accept (✓)** or **Reject (✗)** with a single click.
 4. **Customizable Review Templates**: Define your own criteria for what the agent should flag as a *Comment* versus fix as a *Suggested Edit* directly in the Web UI.
-5. **Personal Google Account + Google Drive Picker**: Sign in with your own Google account, browse **My Drive** or **Shared Drives** via the native Google Drive Picker modal, and review any Google Doc you have access to—so every comment and suggested edit appears under your name.
+5. **Interactive `@ai` Comment Assistant (`app/addons/ai_comments.py` — Part 3 Add-On)**: Highlight any sentence, paragraph, or code block in Google Docs and leave a comment starting with `@ai` (e.g., `@ai make this 50% shorter for executives` or `@ai fact-check this quota and rewrite`). The agent resolves the exact `CommentAnchor` character range, proposes an inline **Suggested Edit (`writeMode: "SUGGEST"`)**, and replies directly inside your comment thread via `addCommentReply`.
+6. **Personal Google Account + Google Drive Picker**: Sign in with your own Google account, browse **My Drive** or **Shared Drives** via the native Google Drive Picker modal, and review any Google Doc you have access to—so every comment and suggested edit appears under your name.
 
 ---
 
@@ -28,31 +29,37 @@ flowchart LR
         Auth["OAuth 2.0 Web Flow\n(/auth/login & /auth/callback)"]
         State["ADK Session State\n(user_access_token + criteria)"]
         Agent["ADK Root Agent\n(doc_reviewer_101)"]
+        CommentAgent["@ai Comment Add-On\n(app/addons/ai_comments.py)"]
         SearchAgent["Web Search Sub-Agent\n(AgentTool + google_search)"]
-        Tools["Docs API Tools\n1. read_google_doc\n2. insert_comments\n3. propose_suggested_edits"]
+        Tools["Docs API Tools\n1. read_google_doc\n2. insert_comments\n3. propose_suggested_edits\n4. list_open_ai_comments\n5. respond_to_ai_comments"]
     end
 
     subgraph GCP["Google Cloud, MCP & Workspace APIs"]
         Vertex["Vertex AI\n(Gemini 3.8 Flash)"]
         DevKnow["Developer Knowledge MCP\n(developerknowledge.googleapis.com/mcp)"]
-        DocsAPI["Google Docs API v1\n(insertComment + SUGGEST mode)"]
+        DocsAPI["Google Docs API v1\n(insertComment + addCommentReply + SUGGEST)"]
     end
 
     UI <-->|"1. Sign in with Google"| Auth
     UI <-->|"2. Select Doc"| Picker
-    UI -->|"3. POST /api/review\n(doc_id + custom criteria)"| State
+    UI -->|"3a. POST /api/review\n3b. POST /api/ai-comments"| State
     State --> Agent
+    State --> CommentAgent
     Agent <-->|"Service Account ADC"| Vertex
+    CommentAgent <-->|"Service Account ADC"| Vertex
     Agent <-->|"McpToolset (ADC)"| DevKnow
+    CommentAgent <-->|"McpToolset (ADC)"| DevKnow
     Agent <-->|"AgentTool"| SearchAgent
+    CommentAgent <-->|"AgentTool"| SearchAgent
     SearchAgent <-->|"Google Search Grounding"| Vertex
     Agent --> Tools
+    CommentAgent --> Tools
     Tools -->|"User OAuth Token"| DocsAPI
 ```
 
 ### Dual-Identity Security Model
 This project uses two distinct identities so you never have to share personal Google Docs with a backend service account:
-- **Your Personal Google Account (OAuth 2.0 Token)**: Used *exclusively* by the Google Drive Picker and Google Docs API tools (`read_google_doc`, `insert_comments`, `propose_suggested_edits`) so the agent only accesses documents you select, and all comments/suggestions are authored by you.
+- **Your Personal Google Account (OAuth 2.0 Token)**: Used *exclusively* by the Google Drive Picker and Google Docs API tools (`read_google_doc`, `insert_comments`, `propose_suggested_edits`, `list_open_ai_comments`, `respond_to_ai_comments`) so the agent only accesses documents you select, and all comments/suggestions are authored by you.
 - **Google Cloud Project / Service Account (ADC)**: Used *exclusively* by the ADK `Runner` on the backend to call **Gemini 3.8 Flash** on Vertex AI (`aiplatform.googleapis.com`) and the **Google Developer Knowledge MCP Server** (`developerknowledge.googleapis.com`).
 
 ---
@@ -62,8 +69,10 @@ This project uses two distinct identities so you never have to share personal Go
 ```text
 doc-reviewer-101/
 ├── app/
-│   ├── agent.py               # ADK Root Agent, Developer Knowledge MCP Toolset, Search AgentTool & prompts
-│   ├── tools.py               # Google Docs API v1 tools (1-based index mapping, comments, suggested edits)
+│   ├── agent.py               # Core ADK Root Agent (Parts 1 & 2: Full-Doc Reviewer + Fact-Checker)
+│   ├── tools.py               # Core Google Docs API v1 tools (read_google_doc, insert_comments, propose_suggested_edits)
+│   ├── addons/
+│   │   └── ai_comments.py     # Part 3 Plug-and-Play Add-On (@ai Comments as Prompts -> Suggested Edits + Replies)
 │   ├── fast_api_app.py        # FastAPI server, Google OAuth 2.0 flow, Google Drive Picker UI (/reviewer)
 │   └── app_utils/             # ADK Runner, A2A routes, and telemetry helpers
 ├── tests/                     # Unit and integration tests
@@ -217,6 +226,23 @@ Our engineering team plans to migrate our Python backend to Google Cloud Run nex
 For runtime language support, we are standardizing on Python 3.12, which was officially released in October 2021. We beleive this migration will immediatly reduce our monthly infrastructure bill by 95% within the first week without requiring any load testing.
 ```
 
+### Part 3 Add-On: Testing Interactive `@ai` Comments (`app/addons/ai_comments.py`)
+In addition to full-document reviews, you can use Google Docs comments as an inline AI prompt bar:
+1. Highlight any sentence, paragraph, or code snippet in your Google Doc and leave a comment starting with `@ai` (or `/ai`), for example:
+   - `@ai make this paragraph 50% shorter and punchier for an executive summary`
+   - `@ai fact-check these Cloud Run limits against official Google Cloud docs and rewrite with the accurate numbers`
+   - `@ai convert this curl command into a clean Python requests snippet`
+2. In `http://localhost:8000/reviewer`, select your document and click **Process `@ai` Comments in Doc** (Section 3).
+3. The agent resolves the exact `CommentAnchor` range in your document, proposes the rewrite as an inline **Suggested Edit (`writeMode: "SUGGEST"`)**, and replies directly inside your comment thread (`addCommentReply`) prefixed with `🤖`.
+
+Want to attach the Part 3 `@ai` comment tools directly onto your own existing ADK agent? Import the 1-line helper from `app/addons/ai_comments.py`:
+```python
+from app.agent import root_agent
+from app.addons.ai_comments import attach_ai_comment_tools
+
+attach_ai_comment_tools(root_agent)
+```
+
 ---
 
 ## Deploying to Google Cloud Run
@@ -266,6 +292,9 @@ When you submit a `deleteContentRange` + `insertText` with `writeControl: {"writ
 
 ### 4. Reverse-Index Sorting for Batch Suggested Edits
 Within `propose_suggested_edits`, all matched text ranges are sorted in **descending order by `startIndex`** (`reverse=True`) and filtered to prevent overlapping ranges before sending a single `documents().batchUpdate()` request. Editing from the end of the document toward the beginning ensures earlier character indices never shift during the batch operation.
+
+### 5. Interactive `@ai` Comment Resolution (`CommentThread` + `CommentAnchor` + `addCommentReply`)
+In `app/addons/ai_comments.py`, calling `documents().get(commentsViewMode="COMMENTS_VIEW_MODE_INCLUDED", suggestionsViewMode="SUGGESTIONS_INLINE", includeTabsContent=True)` returns both `doc["comments"]` (`CommentThread` list) and `tab["documentTab"]["commentAnchors"]` (`CommentAnchor` map). Each open `@ai` comment's `anchorId` maps directly to its `[startIndex, endIndex)` range in the document body, allowing the agent to propose a non-destructive Suggested Edit on that exact range and post an in-thread reply using `addCommentReply`.
 
 ---
 
