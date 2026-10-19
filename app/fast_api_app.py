@@ -48,6 +48,7 @@ DOC_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{10,100}$")
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.addons.ai_comments import ai_comment_app
+    from app.addons.review_board import review_board_app
     from app.agent import app as adk_app
     from app.agent import root_agent
 
@@ -66,10 +67,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         artifact_service=artifact_service,
         auto_create_session=True,
     )
+    review_board_runner = Runner(
+        app=review_board_app,
+        session_service=session_service,
+        artifact_service=artifact_service,
+        auto_create_session=True,
+    )
     app.state.runner = runner
     app.state.agent_app_name = adk_app.name
     app.state.ai_comment_runner = ai_comment_runner
     app.state.ai_comment_app_name = ai_comment_app.name
+    app.state.review_board_runner = review_board_runner
+    app.state.review_board_app_name = review_board_app.name
     await attach_a2a_routes(
         app,
         agent=root_agent,
@@ -340,6 +349,62 @@ async def process_ai_comments(body: AiCommentsRequest, request: Request):
     }
 
 
+class ReviewBoardRequest(BaseModel):
+    document_id: str
+
+
+@app.post("/api/review-board")
+async def run_review_board(body: ReviewBoardRequest, request: Request):
+    """Part 4 Add-On Endpoint: Runs the Multi-Persona Virtual Review Board (SequentialAgent + ParallelAgent)."""
+    token = _get_user_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Please sign in with Google first.")
+
+    doc_id = body.document_id.strip()
+    if not DOC_ID_PATTERN.match(doc_id):
+        raise HTTPException(status_code=400, detail="Invalid Google Document ID.")
+
+    runner: Runner = request.app.state.review_board_runner
+    app_name: str = request.app.state.review_board_app_name
+    user_id = "web-user"
+    adk_session_id = str(uuid.uuid4())
+
+    await runner.session_service.create_session(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=adk_session_id,
+        state={
+            "user_access_token": token,
+            "document_id": doc_id,
+        },
+    )
+
+    prompt = f"Run the Multi-Persona Virtual Review Board on Google Doc ID {doc_id}"
+    final_text = ""
+    chief_editor_text = ""
+
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=adk_session_id,
+        new_message=genai_types.Content(
+            role="user", parts=[genai_types.Part.from_text(text=prompt)]
+        ),
+    ):
+        if event.is_final_response() and event.content and event.content.parts:
+            text_chunk = "".join(p.text or "" for p in event.content.parts).strip()
+            if text_chunk:
+                final_text = text_chunk
+                if getattr(event, "author", "") == "chief_editor_synthesizer":
+                    chief_editor_text = text_chunk
+
+    return {
+        "status": "success",
+        "document_id": doc_id,
+        "document_url": f"https://docs.google.com/document/d/{doc_id}/edit",
+        "summary": chief_editor_text or final_text,
+    }
+
+
 REVIEWER_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -358,6 +423,8 @@ REVIEWER_HTML = """<!DOCTYPE html>
     .btn-picker { background: #0f9d58; color: #fff; font-weight: 500; margin-top: 8px; margin-bottom: 12px; }
     .btn-purple { background: #7c3aed; color: #fff; font-weight: 500; }
     .btn-purple:disabled { background: #c4b5fd; }
+    .btn-teal { background: #0d9488; color: #fff; font-weight: 500; }
+    .btn-teal:disabled { background: #99f6e4; }
     input, textarea { width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 0.95rem; margin-top: 6px; margin-bottom: 16px; box-sizing: border-box; font-family: inherit; }
     textarea { resize: vertical; min-height: 90px; line-height: 1.4; }
     pre { white-space: pre-wrap; background: #f3f4f6; padding: 16px; border-radius: 8px; line-height: 1.5; }
@@ -423,6 +490,16 @@ REVIEWER_HTML = """<!DOCTYPE html>
         </p>
         <button id="ai-comments-btn" type="button" class="btn-purple">Process @ai Comments in Doc</button>
       </div>
+
+      <div class="addon-card">
+        <strong>4. 🏛️ Multi-Persona Virtual Review Board (Part 4 Add-On — <code>ParallelAgent</code> + <code>SequentialAgent</code>)</strong>
+        <p class="hint" style="margin-top: 6px; margin-bottom: 12px;">
+          Runs three specialist ADK agents concurrently in parallel—<strong>🔒 Security &amp; Architecture Reviewer</strong>,
+          <strong>🔍 Technical Fact-Checker</strong> (MCP + Google Search), and <strong>✍️ Executive Copy Editor</strong>—before
+          a <strong>Chief Editor Agent</strong> deduplicates overlapping edits and applies persona-badged Comments and Suggested Edits!
+        </p>
+        <button id="review-board-btn" type="button" class="btn-teal">Run Multi-Persona Review Board</button>
+      </div>
     </div>
   </div>
 
@@ -445,6 +522,7 @@ REVIEWER_HTML = """<!DOCTYPE html>
     const resetTemplateBtn = document.getElementById('reset-template-btn');
     const reviewBtn = document.getElementById('review-btn');
     const aiCommentsBtn = document.getElementById('ai-comments-btn');
+    const reviewBoardBtn = document.getElementById('review-board-btn');
     const resultCard = document.getElementById('result-card');
     const resultTitle = document.getElementById('result-title');
     const resultSummary = document.getElementById('result-summary');
@@ -462,6 +540,12 @@ REVIEWER_HTML = """<!DOCTYPE html>
     function clearError() {
       statusBanner.textContent = '';
       statusBanner.classList.add('hidden');
+    }
+
+    function setAllButtonsDisabled(disabled) {
+      reviewBtn.disabled = disabled;
+      aiCommentsBtn.disabled = disabled;
+      reviewBoardBtn.disabled = disabled;
     }
 
     if (window.gapi) {
@@ -550,8 +634,7 @@ REVIEWER_HTML = """<!DOCTYPE html>
         showError('Please choose a document with Browse Google Drive or enter a Document ID.');
         return;
       }
-      reviewBtn.disabled = true;
-      aiCommentsBtn.disabled = true;
+      setAllButtonsDisabled(true);
       reviewBtn.textContent = 'Reviewing Document (takes ~15-30s)...';
       resultCard.classList.add('hidden');
 
@@ -577,8 +660,7 @@ REVIEWER_HTML = """<!DOCTYPE html>
       } catch (err) {
         showError('Request failed: ' + err.message);
       } finally {
-        reviewBtn.disabled = false;
-        aiCommentsBtn.disabled = false;
+        setAllButtonsDisabled(false);
         reviewBtn.textContent = 'Run AI Review';
       }
     });
@@ -590,8 +672,7 @@ REVIEWER_HTML = """<!DOCTYPE html>
         showError('Please choose a document with Browse Google Drive or enter a Document ID.');
         return;
       }
-      aiCommentsBtn.disabled = true;
-      reviewBtn.disabled = true;
+      setAllButtonsDisabled(true);
       aiCommentsBtn.textContent = 'Processing @ai Comments (takes ~10-25s)...';
       resultCard.classList.add('hidden');
 
@@ -613,9 +694,42 @@ REVIEWER_HTML = """<!DOCTYPE html>
       } catch (err) {
         showError('Request failed: ' + err.message);
       } finally {
-        aiCommentsBtn.disabled = false;
-        reviewBtn.disabled = false;
+        setAllButtonsDisabled(false);
         aiCommentsBtn.textContent = 'Process @ai Comments in Doc';
+      }
+    });
+
+    reviewBoardBtn.addEventListener('click', async () => {
+      clearError();
+      const docId = docInput.value.trim();
+      if (!docId) {
+        showError('Please choose a document with Browse Google Drive or enter a Document ID.');
+        return;
+      }
+      setAllButtonsDisabled(true);
+      reviewBoardBtn.textContent = 'Running 3 Parallel Reviewers + Chief Editor (takes ~20-35s)...';
+      resultCard.classList.add('hidden');
+
+      try {
+        const resp = await fetch('/api/review-board', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ document_id: docId })
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          showError(data.detail || 'Error running Multi-Persona Review Board.');
+          return;
+        }
+        resultTitle.textContent = 'Multi-Persona Virtual Review Board Complete';
+        docLink.href = data.document_url;
+        resultSummary.textContent = data.summary;
+        resultCard.classList.remove('hidden');
+      } catch (err) {
+        showError('Request failed: ' + err.message);
+      } finally {
+        setAllButtonsDisabled(false);
+        reviewBoardBtn.textContent = 'Run Multi-Persona Review Board';
       }
     });
 

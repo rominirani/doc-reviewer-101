@@ -12,7 +12,8 @@ Instead of destructively overwriting your document text or dumping feedback into
 3. **Proposes Inline Suggested Edits (`writeControl: {"writeMode": "SUGGEST"}`)** for outdated numbers, wrong CLI flags, typos, grammar, and style improvements that you can **Accept (✓)** or **Reject (✗)** with a single click.
 4. **Customizable Review Templates**: Define your own criteria for what the agent should flag as a *Comment* versus fix as a *Suggested Edit* directly in the Web UI.
 5. **Interactive `@ai` Comment Assistant (`app/addons/ai_comments.py` — Part 3 Add-On)**: Highlight any sentence, paragraph, or code block in Google Docs and leave a comment starting with `@ai` (e.g., `@ai make this 50% shorter for executives` or `@ai fact-check this quota and rewrite`). The agent resolves the exact `CommentAnchor` character range, proposes an inline **Suggested Edit (`writeMode: "SUGGEST"`)**, and replies directly inside your comment thread via `addCommentReply`.
-6. **Personal Google Account + Google Drive Picker**: Sign in with your own Google account, browse **My Drive** or **Shared Drives** via the native Google Drive Picker modal, and review any Google Doc you have access to—so every comment and suggested edit appears under your name.
+6. **Multi-Persona Virtual Review Board (`app/addons/review_board.py` — Part 4 Add-On)**: Uses ADK's **`SequentialAgent`** and **`ParallelAgent`** to read a Google Doc once into `session.state`, fan out concurrently to 3 specialist personas (**🔒 Security & Architecture Reviewer**, **🔍 Technical Fact-Checker**, and **✍️ Executive Copy Editor**), and fan in via a **🏛️ Chief Editor Synthesizer** that deduplicates overlapping edit ranges and applies persona-badged Comments and Suggested Edits.
+7. **Personal Google Account + Google Drive Picker**: Sign in with your own Google account, browse **My Drive** or **Shared Drives** via the native Google Drive Picker modal, and review any Google Doc you have access to—so every comment and suggested edit appears under your name.
 
 ---
 
@@ -27,9 +28,10 @@ flowchart LR
 
     subgraph CloudRun["FastAPI + Google ADK (Local or Cloud Run)"]
         Auth["OAuth 2.0 Web Flow\n(/auth/login & /auth/callback)"]
-        State["ADK Session State\n(user_access_token + criteria)"]
-        Agent["ADK Root Agent\n(doc_reviewer_101)"]
-        CommentAgent["@ai Comment Add-On\n(app/addons/ai_comments.py)"]
+        State["ADK Session State\n(user_access_token + doc_text)"]
+        Agent["ADK Root Agent\n(Parts 1 & 2: doc_reviewer_101)"]
+        CommentAgent["Part 3 Add-On\n(app/addons/ai_comments.py)"]
+        ReviewBoard["Part 4 Review Board\n(SequentialAgent + ParallelAgent\napp/addons/review_board.py)"]
         SearchAgent["Web Search Sub-Agent\n(AgentTool + google_search)"]
         Tools["Docs API Tools\n1. read_google_doc\n2. insert_comments\n3. propose_suggested_edits\n4. list_open_ai_comments\n5. respond_to_ai_comments"]
     end
@@ -42,18 +44,23 @@ flowchart LR
 
     UI <-->|"1. Sign in with Google"| Auth
     UI <-->|"2. Select Doc"| Picker
-    UI -->|"3a. POST /api/review\n3b. POST /api/ai-comments"| State
+    UI -->|"3a. POST /api/review\n3b. POST /api/ai-comments\n3c. POST /api/review-board"| State
     State --> Agent
     State --> CommentAgent
+    State --> ReviewBoard
     Agent <-->|"Service Account ADC"| Vertex
     CommentAgent <-->|"Service Account ADC"| Vertex
+    ReviewBoard <-->|"Service Account ADC"| Vertex
     Agent <-->|"McpToolset (ADC)"| DevKnow
     CommentAgent <-->|"McpToolset (ADC)"| DevKnow
+    ReviewBoard <-->|"McpToolset (ADC)"| DevKnow
     Agent <-->|"AgentTool"| SearchAgent
     CommentAgent <-->|"AgentTool"| SearchAgent
+    ReviewBoard <-->|"AgentTool"| SearchAgent
     SearchAgent <-->|"Google Search Grounding"| Vertex
     Agent --> Tools
     CommentAgent --> Tools
+    ReviewBoard --> Tools
     Tools -->|"User OAuth Token"| DocsAPI
 ```
 
@@ -72,7 +79,8 @@ doc-reviewer-101/
 │   ├── agent.py               # Core ADK Root Agent (Parts 1 & 2: Full-Doc Reviewer + Fact-Checker)
 │   ├── tools.py               # Core Google Docs API v1 tools (read_google_doc, insert_comments, propose_suggested_edits)
 │   ├── addons/
-│   │   └── ai_comments.py     # Part 3 Plug-and-Play Add-On (@ai Comments as Prompts -> Suggested Edits + Replies)
+│   │   ├── ai_comments.py     # Part 3 Plug-and-Play Add-On (@ai Comments as Prompts -> Suggested Edits + Replies)
+│   │   └── review_board.py    # Part 4 Plug-and-Play Add-On (Multi-Persona Review Board: SequentialAgent + ParallelAgent)
 │   ├── fast_api_app.py        # FastAPI server, Google OAuth 2.0 flow, Google Drive Picker UI (/reviewer)
 │   └── app_utils/             # ADK Runner, A2A routes, and telemetry helpers
 ├── tests/                     # Unit and integration tests
@@ -243,6 +251,31 @@ from app.addons.ai_comments import attach_ai_comment_tools
 attach_ai_comment_tools(root_agent)
 ```
 
+### Part 4 Add-On: Multi-Persona Virtual Review Board (`app/addons/review_board.py`)
+For complex architecture RFCs, security design docs, and launch posts, you can run a 3-stage **Multi-Persona Virtual Review Board** orchestrated by ADK's **`SequentialAgent`** and **`ParallelAgent`**:
+1. Paste this sample **"Flawed Cloud Architecture RFC"** into a test Google Doc (it plants 2 security flaws, 2 factual errors, and 2 copy-editing flaws):
+   ```text
+   Project Titan: Payment Microservice Architecture RFC
+
+   1. Authentication & Deployment Configuration
+   To speed up development, the payment microservice connects to Stripe using STRIPE_API_KEY="sk_live_998877665544332211" in the container environment variables. We will grant the default compute service account roles/owner across the production GCP project and deploy the service with gcloud run deploy payment-service --allow-unauthenticated so partner webhooks and internal services can reach it easily.
+
+   2. Platform Quotas & Runtime Specifications
+   We are migrating off Cloud Run because Cloud Run has a maximum request timeout of 5 minutes and only supports up to 2 vCPUs and 4 GB of memory per instance. Additionally, we are upgrading our base container image to Python 3.12, which was officially released in January 2025.
+
+   3. Rollout Plan
+   In order to basicly acheive our Q3 reliability milestones, it is critical that the migration be executed by the platform engineering team utilizing the blue-green deployment methodology.
+   ```
+2. In `http://localhost:8000/reviewer`, select your document and click **Run Multi-Persona Review Board** (Section 4).
+3. The workflow reads the Google Doc once into `session.state`, runs all 3 specialists concurrently (`🔒 Security Reviewer`, `🔍 Technical Fact-Checker`, `✍️ Executive Copy Editor`), and synthesizes their findings into persona-badged anchored comments (`[🔒 Security Review]`, `[🔍 Fact-Check]`, `[✍️ Copy Editor]`) and non-overlapping inline Suggested Edits!
+
+Want to bolt the entire 3-stage Review Board workflow onto your existing ADK `root_agent` as a callable sub-agent tool? Use `get_review_board_agent_tool()` from `app/addons/review_board.py`:
+```python
+from app.addons.review_board import get_review_board_agent_tool
+
+# Add get_review_board_agent_tool() to root_agent.tools
+```
+
 ---
 
 ## Deploying to Google Cloud Run
@@ -295,6 +328,12 @@ Within `propose_suggested_edits`, all matched text ranges are sorted in **descen
 
 ### 5. Interactive `@ai` Comment Resolution (`CommentThread` + `CommentAnchor` + `addCommentReply`)
 In `app/addons/ai_comments.py`, calling `documents().get(commentsViewMode="COMMENTS_VIEW_MODE_INCLUDED", suggestionsViewMode="SUGGESTIONS_INLINE", includeTabsContent=True)` returns both `doc["comments"]` (`CommentThread` list) and `tab["documentTab"]["commentAnchors"]` (`CommentAnchor` map). Each open `@ai` comment's `anchorId` maps directly to its `[startIndex, endIndex)` range in the document body, allowing the agent to propose a non-destructive Suggested Edit on that exact range and post an in-thread reply using `addCommentReply`.
+
+### 6. Deterministic Multi-Agent Fan-Out / Fan-In (`SequentialAgent` + `ParallelAgent`)
+In `app/addons/review_board.py`, `review_board_agent` is a `SequentialAgent` that orchestrates three deterministic stages:
+1. **Stage 1 (`doc_ingestion_agent`)**: Calls `load_doc_into_state` once and stores `document_id`, `doc_title`, and `doc_text` in `session.state` so parallel branches never duplicate Google Docs API reads.
+2. **Stage 2 (`specialist_review_board = ParallelAgent(...)`)**: Runs `security_reviewer`, `fact_checker_reviewer`, and `copy_editor_reviewer` concurrently. Each specialist uses `include_contents="none"`, reads `{doc_text?}` from `session.state`, and saves its JSON findings to an isolated `output_key` (`security_findings`, `fact_check_findings`, `editorial_findings`).
+3. **Stage 3 (`chief_editor_synthesizer`)**: Reads all three findings from `session.state`, resolves overlapping `target_text` ranges (`Security > Fact-Check > Copy Edit`), prefixes persona badges (`[🔒 Security Review]`, `[🔍 Fact-Check]`, `[✍️ Copy Editor]`), and calls `insert_comments` first followed by `propose_suggested_edits` second.
 
 ---
 
