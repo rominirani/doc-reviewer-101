@@ -394,8 +394,18 @@ async def run_review_board(body: ReviewBoardRequest, request: Request):
             text_chunk = "".join(p.text or "" for p in event.content.parts).strip()
             if text_chunk:
                 final_text = text_chunk
-                if getattr(event, "author", "") == "chief_editor_synthesizer":
+                if getattr(event, "author", "") in (
+                    "chief_editor_synthesizer",
+                    "handle_doc_load_error",
+                ):
                     chief_editor_text = text_chunk
+        elif isinstance(getattr(event, "output", None), str) and event.output.strip():
+            if getattr(event, "author", "") in (
+                "chief_editor_synthesizer",
+                "handle_doc_load_error",
+                "multi_persona_review_board",
+            ):
+                chief_editor_text = event.output.strip()
 
     return {
         "status": "success",
@@ -492,11 +502,10 @@ REVIEWER_HTML = """<!DOCTYPE html>
       </div>
 
       <div class="addon-card">
-        <strong>4. 🏛️ Multi-Persona Virtual Review Board (Part 4 Add-On — <code>ParallelAgent</code> + <code>SequentialAgent</code>)</strong>
+        <strong>4. 🏛️ Multi-Persona Virtual Review Board (Part 4 Add-On — ADK 2.0 Graph <code>Workflow</code>)</strong>
         <p class="hint" style="margin-top: 6px; margin-bottom: 12px;">
-          Runs three specialist ADK agents concurrently in parallel—<strong>🔒 Security &amp; Architecture Reviewer</strong>,
-          <strong>🔍 Technical Fact-Checker</strong> (MCP + Google Search), and <strong>✍️ Executive Copy Editor</strong>—before
-          a <strong>Chief Editor Agent</strong> deduplicates overlapping edits and applies persona-badged Comments and Suggested Edits!
+          Uses an ADK 2.0 Graph <code>Workflow</code> (<code>FunctionNode</code> + conditional <code>RoutingMap</code> + <code>JoinNode</code>) to read the Google Doc once with zero LLM overhead, fan out concurrently to three specialists—<strong>🔒 Security &amp; Architecture Reviewer</strong>,
+          <strong>🔍 Technical Fact-Checker</strong> (MCP + Google Search), and <strong>✍️ Executive Copy Editor</strong>—synchronize at a <code>JoinNode</code> barrier, and synthesize persona-badged Comments and Suggested Edits!
         </p>
         <button id="review-board-btn" type="button" class="btn-teal">Run Multi-Persona Review Board</button>
       </div>
